@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 from tqdm import tqdm
 import argparse
+import re
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -22,11 +23,30 @@ def parse_args():
                         help="输出目录")
     parser.add_argument("--phenotype_file", type=str, default=None,
                         help="表型文件(可选),用于过滤和标注样本")
-    parser.add_argument("--file_pattern", type=str, default="block_*_processed.json",
+    parser.add_argument("--file_pattern", type=str, default="block_*_normalized.json",
                         help="JSON文件匹配模式")
     parser.add_argument("--merge_all", action="store_true",
                         help="是否也生成合并所有block的矩阵")
     return parser.parse_args()
+
+def extract_block_name(filename):
+    """
+    从文件名提取block名称
+    例如:
+      block_1_normalized.json -> block_1
+      block_2_processed.json -> block_2
+      block_10.json -> block_10
+    """
+    # 去掉后缀
+    stem = Path(filename).stem
+    
+    # 使用正则表达式提取 block_数字
+    match = re.match(r'(block_\d+)', stem)
+    if match:
+        return match.group(1)
+    
+    # 如果没有匹配，返回原始stem
+    return stem
 
 def load_bed_positions(bed_file):
     """
@@ -200,6 +220,8 @@ def main():
     print("\n1. 加载BED文件...")
     block_positions = load_bed_positions(args.bed_file)
     print(f"   加载了 {len(block_positions)} 个block的位置信息")
+    for name, info in list(block_positions.items())[:3]:
+        print(f"     - {name}: chr{info['chrom']}:{info['start']}-{info['end']}")
     
     # 2. 加载表型文件(如果提供)
     phenotype_df = None
@@ -217,6 +239,9 @@ def main():
         raise ValueError(f"未找到匹配的JSON文件: {args.file_pattern}")
     
     print(f"   找到 {len(json_files)} 个JSON文件")
+    for jf in json_files[:3]:
+        extracted_name = extract_block_name(jf.name)
+        print(f"     - {jf.name} -> {extracted_name}")
     
     # 4. 逐个处理JSON文件并保存
     print("\n4. 处理JSON文件并保存到各自文件夹...")
@@ -226,10 +251,11 @@ def main():
     
     for json_file in tqdm(json_files, desc="处理blocks"):
         # 从文件名提取block名称
-        block_name = json_file.stem.replace("_processed", "")
+        block_name = extract_block_name(json_file.name)
         
         if block_name not in block_positions:
             print(f"  警告: {block_name} 不在BED文件中,跳过")
+            print(f"    可用的block名称: {list(block_positions.keys())}")
             continue
         
         # 获取位置信息

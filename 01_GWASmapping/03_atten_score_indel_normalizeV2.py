@@ -144,89 +144,115 @@ def load_variants_in_region_from_vcf(vcf_file, chrom, start, end):
     return pd.DataFrame(variants_list).sort_values('POS')
 
 
-def build_position_mapping(ref_seq, sample_seq, variants, ref_start):
+def get_sample_variants_from_vcf(vcf_file, chrom, start, end, sample_id, all_samples):
     """
-    构建样本序列位置到参考序列位置的映射
+    从VCF获取特定样本实际携带的变异
+    
+    返回: list of (position, variant_type, ins_length)
+    """
+    vcf = VCF(vcf_file)
+    
+    # 找到样本索引
+    if sample_id not in all_samples:
+        vcf.close()
+        return []
+    
+    sample_idx = all_samples.index(sample_id)
+    
+    sample_variants = []
+    
+    # VCF染色体名可能是"4"或"AP014960.1"
+    vcf_chrom_names = [str(chrom), chrom_map.get(str(chrom), str(chrom))]
+    
+    for vcf_chrom in vcf_chrom_names:
+        try:
+            for variant in vcf(f"{vcf_chrom}:{start}-{end}"):
+                # 获取该样本的基因型
+                gt = variant.genotypes[sample_idx]
+                allele1, allele2 = gt[0], gt[1]
+                
+                # 跳过参考型 0/0
+                if allele1 == 0 and allele2 == 0:
+                    continue
+                
+                # 跳过缺失基因型
+                if allele1 == -1 or allele2 == -1:
+                    continue
+                # 🔥 正确逻辑：逐个等位基因判断，只记录 INS
+                alleles = [allele1, allele2]
+
+                for allele_idx in alleles:
+                    if allele_idx <= 0:
+                        continue
+
+                    if allele_idx - 1 >= len(variant.ALT):
+                        continue
+
+                    alt = variant.ALT[allele_idx - 1]
+                    ref = variant.REF
+
+                    var_type, ins_len = get_variant_info(ref, alt)
+
+                    # 只有当该样本真的携带 INS 时才记录
+                    if var_type == 'INS' and ins_len > 0:
+                        sample_variants.append({
+                            'POS': variant.POS,
+                            'ins_length': ins_len
+                        })
+
+            
+            if len(sample_variants) > 0 or vcf_chrom == vcf_chrom_names[-1]:
+                break
+        except Exception as e:
+            continue
+    
+    vcf.close()
+    return sample_variants
+
+
+def build_position_mapping_with_sample_variants(ref_seq, sample_variants, ref_start):
+    """
+    使用样本实际携带的变异构建映射
     
     参数:
         ref_seq: 参考序列
-        sample_seq: 样本序列
-        variants: 该区间的变异信息 DataFrame
-        ref_start: 参考序列起始位置(0-based in genome)
+        sample_variants: 该样本实际携带的变异列表
+        ref_start: 参考序列起始位置
     
     返回:
-        mapping: list, mapping[sample_pos] = ref_pos
-                如果mapping[i] = j, 表示样本序列第i个碱基对应参考序列第j个碱基
-                如果mapping[i] = -1, 表示这是插入的碱基,需要与前后平均
+        mapping: 样本序列位置 -> 参考序列位置
     """
     ref_len = len(ref_seq)
-    sample_len = len(sample_seq)
     
-    # 初始化映射: 默认一一对应
-    mapping = list(range(min(ref_len, sample_len)))
+    # 如果没有插入变异，长度相同
+    if not sample_variants:
+        return list(range(ref_len))
     
-    # 如果长度相同,直接返回
-    if sample_len == ref_len:
-        return mapping
-    
-    # 构建每个参考位置的变异信息
-    var_dict = {}  # {ref_offset: variant_info}
-    
-    for _, var in variants.iterrows():
-        ref_offset = var['POS'] - ref_start - 1  # 0-based offset
+    # 构建变异字典：ref_offset -> ins_length
+    var_dict = {}
+    for var in sample_variants:
+        ref_offset = var['POS'] - ref_start - 1
         if 0 <= ref_offset < ref_len:
-            var_dict[ref_offset] = {
-                'type': var['variant_type'],
-                'ins_len': var['ins_length']
-            }
+            var_dict[ref_offset] = var['ins_length']
     
-    # 重建映射
-    new_mapping = []
-    sample_pos = 0
+    # 构建映射
+    mapping = []
     ref_pos = 0
     
-    while ref_pos < ref_len and sample_pos < sample_len:
-        # 检查该位置是否有变异
+    while ref_pos < ref_len:
+        # 当前参考位置
+        mapping.append(ref_pos)
+        
+        # 检查该位置是否有插入
         if ref_pos in var_dict:
-            var_info = var_dict[ref_pos]
-            
-            if var_info['type'] == 'INS' and var_info['ins_len'] > 0:
-                # 插入: 
-                # 第1个碱基对应ref_pos
-                new_mapping.append(ref_pos)
-                sample_pos += 1
-                
-                # 后续插入的碱基标记为-1(需要平均)
-                for _ in range(var_info['ins_len']):
-                    if sample_pos < sample_len:
-                        new_mapping.append(-1)  # 插入标记
-                        sample_pos += 1
-                
-                ref_pos += 1
-            
-            elif var_info['type'] == 'DEL':
-                # 缺失: 样本序列该位置是N,保持对应
-                new_mapping.append(ref_pos)
-                sample_pos += 1
-                ref_pos += 1
-            
-            else:
-                # SNP或其他
-                new_mapping.append(ref_pos)
-                sample_pos += 1
-                ref_pos += 1
-        else:
-            # 无变异,正常对应
-            new_mapping.append(ref_pos)
-            sample_pos += 1
-            ref_pos += 1
+            ins_len = var_dict[ref_pos]
+            # 添加插入的碱基（标记为-1）
+            for _ in range(ins_len):
+                mapping.append(-1)
+        
+        ref_pos += 1
     
-    # 处理剩余部分
-    while sample_pos < sample_len:
-        new_mapping.append(ref_len - 1)  # 超出部分映射到最后
-        sample_pos += 1
-    
-    return new_mapping
+    return mapping
 
 
 def normalize_attention_scores(scores, mapping, ref_len):
@@ -284,7 +310,7 @@ def normalize_attention_scores(scores, mapping, ref_len):
 
 
 def process_block(block_name, json_file, seq_json_file, bed_row, 
-                  vcf_file, fasta, output_dir):
+                  vcf_file, fasta, output_dir, all_samples):
     """
     处理单个block
     """
@@ -304,21 +330,21 @@ def process_block(block_name, json_file, seq_json_file, bed_row,
     
     print(f"  参考序列长度: {ref_len}")
     
-    # 2. 读取变异信息
+    # 2. 读取变异信息（仅用于统计显示）
     variants = load_variants_in_region_from_vcf(vcf_file, chrom, start, end)
-    print(f"  变异数: {len(variants)}")
+    print(f"  VCF中变异数: {len(variants)}")
     
     if len(variants) > 0:
         n_ins = (variants['variant_type'] == 'INS').sum()
         n_del = (variants['variant_type'] == 'DEL').sum()
         n_snp = (variants['variant_type'] == 'SNP').sum()
-        print(f"    SNP: {n_snp}, INS: {n_ins}, DEL: {n_del}")
+        print(f"    (统计: SNP: {n_snp}, INS: {n_ins}, DEL: {n_del})")
     
     # 3. 读取原始attention分数
     with open(json_file, 'r') as f:
         attention_data = json.load(f)
     
-    # 4. 读取样本序列(用于构建映射)
+    # 4. 读取样本序列(用于验证)
     with open(seq_json_file, 'r') as f:
         seq_data = json.load(f)
     
@@ -348,9 +374,25 @@ def process_block(block_name, json_file, seq_json_file, bed_row,
             else:
                 original_scores = original_scores + [0.0] * (len(sample_seq) - len(original_scores))
         
-        # 构建位置映射
-        mapping = build_position_mapping(ref_seq, sample_seq, variants, start)
+        # 🔥 关键修改：从VCF读取该样本实际携带的变异
+        sample_variants = get_sample_variants_from_vcf(
+            vcf_file, chrom, start, end, sample_id, all_samples
+        )
         
+        # 构建位置映射（只使用该样本实际的插入变异）
+        mapping = build_position_mapping_with_sample_variants(
+            ref_seq, sample_variants, start
+        )
+        # 🔐 安全校验：样本长度 ≠ mapping 长度 → 禁止使用插入映射
+        if len(mapping) != len(sample_seq):
+            print(
+                f"⚠️ 回退为无插入映射: {sample_id} "
+                f"(seq={len(sample_seq)}, map={len(mapping)})"
+            )
+            mapping = list(range(len(ref_seq)))
+
+
+
         # 标准化分数
         normalized_scores = normalize_attention_scores(original_scores, mapping, ref_len)
         
@@ -403,6 +445,13 @@ def main():
         print(f"错误: VCF文件不存在: {args.vcf_file}")
         return
     
+    # 读取VCF样本列表
+    print("\n读取VCF样本列表...")
+    vcf = VCF(args.vcf_file)
+    all_samples = vcf.samples
+    vcf.close()
+    print(f"VCF包含 {len(all_samples)} 个样本")
+    
     # 处理每个block
     results = []
     
@@ -422,7 +471,7 @@ def main():
         
         result = process_block(
             block_name, json_file, seq_json_file, row,
-            args.vcf_file, fasta, args.output_dir
+            args.vcf_file, fasta, args.output_dir, all_samples
         )
         
         if result:
