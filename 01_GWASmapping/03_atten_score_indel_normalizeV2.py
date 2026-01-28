@@ -458,7 +458,7 @@ def main():
     for block_id, row in bed_df.iterrows():
         block_name = f"block_{block_id + 1}"
         
-        json_file = os.path.join(args.json_dir, f"{block_name}_processed.json")
+        json_file = os.path.join(args.json_dir, f"{block_name}_attn.json")
         seq_json_file = os.path.join(args.seq_json_dir, f"{block_name}.json")
         
         if not os.path.exists(json_file):
